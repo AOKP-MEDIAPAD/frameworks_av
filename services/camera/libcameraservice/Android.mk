@@ -48,6 +48,10 @@ ifeq ($(BOARD_HAVE_HTC_FFC),true)
 LOCAL_CFLAGS += -DBOARD_HAVE_HTC_FFC
 endif
 
+ifeq ($(CAMERA_FC_HACK), true)
+LOCAL_CFLAGS     += -DCAMERA_FC_HACK
+endif
+
 LOCAL_MODULE:= libcameraservice
 
 include $(BUILD_SHARED_LIBRARY)

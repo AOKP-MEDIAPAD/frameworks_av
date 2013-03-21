@@ -43,6 +43,7 @@
 #include <media/stagefright/Utils.h>
 #include <media/stagefright/SkipCutBuffer.h>
 #include <utils/Vector.h>
+#include <cutils/properties.h>
 
 #include <OMX_Audio.h>
 #include <OMX_Component.h>
@@ -55,8 +56,17 @@
 #endif
 #include "include/avc_utils.h"
 
+#ifdef QCOM_HARDWARE
+#include <QOMX_AudioExtensions.h>
+#include <OMX_QCOMExtns.h>
+#endif
+
 #ifdef USE_SAMSUNG_COLORFORMAT
 #include <sec_format.h>
+#endif
+
+#ifdef QCOM_ICS_COMPAT
+#include <gralloc_priv.h>
 #endif
 
 #ifdef USE_TI_CUSTOM_DOMX
@@ -98,6 +108,9 @@ const static int64_t kBufferFilledEventTimeOutNs = 3000000000LL;
 // component in question is buggy or not.
 const static uint32_t kMaxColorFormatSupported = 1000;
 
+#ifdef QCOM_LEGACY_OMX
+static const int QOMX_COLOR_FormatYUV420PackedSemiPlanar64x32Tile2m8ka = 0x7FA30C03;
+#endif
 
 #define FACTORY_CREATE(name) \
 static sp<MediaSource> Make##name(const sp<MediaSource> &source) { \
@@ -324,6 +337,18 @@ uint32_t OMXCodec::getComponentQuirks(
       quirks |= kRequiresLoadedToIdleAfterAllocation;
     }
     if (list->codecHasQuirk(
+                index, "defers-output-buffer-allocation")) {
+        quirks |= kDefersOutputBufferAllocation;
+    }
+    if (list->codecHasQuirk(
+                index, "avoid-memcopy-input-recording-frames")) {
+      quirks |= kAvoidMemcopyInputRecordingFrames;
+    }
+    if (list->codecHasQuirk(
+                index, "input-buffer-sizes-are-bogus")) {
+      quirks |= kInputBufferSizesAreBogus;
+    }
+    if (list->codecHasQuirk(
                 index, "requires-global-flush")) {
         quirks |= kRequiresGlobalFlush;
     }
@@ -346,6 +371,13 @@ uint32_t OMXCodec::getComponentQuirks(
     if (list->codecHasQuirk(
                 index, "input-buffer-sizes-are-bogus")) {
       quirks |= kInputBufferSizesAreBogus;
+    }
+#endif
+
+#ifdef QCOM_LEGACY_OMX
+    if (list->codecHasQuirk(
+                index, "requires-larger-encoder-output-buffer")) {
+            quirks |= kRequiresLargerEncoderOutputBuffer;
     }
 #endif
 
@@ -734,14 +766,18 @@ status_t OMXCodec::configureCodec(const sp<MetaData> &meta) {
 
     if (!strncasecmp(mMIME, "video/", 6)) {
 #ifdef QCOM_HARDWARE
-        if ((mFlags & kClientNeedsFramebuffer) && !strncmp(mComponentName, "OMX.qcom.", 9)) {
-            ALOGV("Enabling thumbnail mode.");
+        if ((!mFlags & kClientNeedsFramebuffer) && !strncmp(mComponentName, "OMX.qcom.", 9)) {
+            ALOGE("Enabling thumbnail mode.");
             QOMX_ENABLETYPE enableType;
             OMX_INDEXTYPE indexType;
 
             status_t err = mOMX->getExtensionIndex(
                 mNode, OMX_QCOM_INDEX_PARAM_VIDEO_SYNCFRAMEDECODINGMODE, &indexType);
 
+#ifdef QCOM_LEGACY_OMX
+            // Don't run this check with the legacy encoder
+            if (strncmp(mComponentName, "OMX.qcom.video.encoder.", 23))
+#endif
             CHECK_EQ(err, (status_t)OK);
 
             enableType.bEnable = OMX_TRUE;
@@ -952,6 +988,12 @@ static size_t getFrameSize(
         case OMX_SEC_COLOR_FormatNV12LPhysicalAddress:
 #endif
             return (width * height * 3) / 2;
+
+#ifdef QCOM_LEGACY_OMX
+       case OMX_QCOM_COLOR_FormatYVU420SemiPlanar:
+            return (((width + 15) & -16) * ((height + 15) & -16) * 3) / 2;
+#endif
+
 #ifdef USE_SAMSUNG_COLORFORMAT
         case OMX_SEC_COLOR_FormatNV12LVirtualAddress:
             return ALIGN((ALIGN(width, 16) * ALIGN(height, 16)), 2048) + ALIGN((ALIGN(width, 16) * ALIGN(height >> 1, 8)), 2048);
@@ -1029,6 +1071,7 @@ void OMXCodec::setVideoInputFormat(
     success = success && meta->findInt32(kKeyBitRate, &bitRate);
     success = success && meta->findInt32(kKeyStride, &stride);
     success = success && meta->findInt32(kKeySliceHeight, &sliceHeight);
+    CODEC_LOGI("setVideoInputFormat width=%d, height=%d", width, height);
     CHECK(success);
     CHECK(stride != 0);
 
@@ -1102,7 +1145,11 @@ void OMXCodec::setVideoInputFormat(
 
     video_def->nFrameWidth = width;
     video_def->nFrameHeight = height;
+#ifdef QCOM_LEGACY_OMX
+    video_def->xFramerate = (frameRate << 16);
+#else
     video_def->xFramerate = 0;      // No need for output port
+#endif
     video_def->nBitrate = bitRate;  // Q16 format
     video_def->eCompressionFormat = compressionFormat;
     video_def->eColorFormat = OMX_COLOR_FormatUnused;
@@ -1435,7 +1482,7 @@ status_t OMXCodec::setVideoOutputFormat(
     success = success && meta->findInt32(kKeyHeight, &height);
     CHECK(success);
 
-    CODEC_LOGV("setVideoOutputFormat width=%ld, height=%ld", width, height);
+    CODEC_LOGV("setVideoOutputFormat width=%d, height=%d", width, height);
 
     OMX_VIDEO_CODINGTYPE compressionFormat = OMX_VIDEO_CodingUnused;
     if (!strcasecmp(MEDIA_MIMETYPE_VIDEO_AVC, mime)) {
@@ -1486,6 +1533,7 @@ status_t OMXCodec::setVideoOutputFormat(
                || format.eColorFormat == OMX_COLOR_FormatCbYCrY
                || format.eColorFormat == OMX_TI_COLOR_FormatYUV420PackedSemiPlanar
                || format.eColorFormat == OMX_QCOM_COLOR_FormatYVU420SemiPlanar
+
                || format.eColorFormat == OMX_QCOM_COLOR_FormatYUV420PackedSemiPlanar64x32Tile2m8ka
 #ifdef USE_SAMSUNG_COLORFORMAT
                || format.eColorFormat == OMX_SEC_COLOR_FormatNV12TPhysicalAddress
@@ -1630,7 +1678,11 @@ OMXCodec::OMXCodec(
       mPaused(false),
       mNativeWindow(
               (!strncmp(componentName, "OMX.google.", 11)
-              || !strcmp(componentName, "OMX.Nvidia.mpeg2v.decode"))
+              || !strcmp(componentName, "OMX.Nvidia.mpeg2v.decode")
+#ifdef QCOM_LEGACY_OMX
+              || !strncmp(componentName, "OMX.qcom",8)
+#endif
+      )
                         ? NULL : nativeWindow) {
     mPortStatus[kPortIndexInput] = ENABLED;
     mPortStatus[kPortIndexOutput] = ENABLED;
@@ -1822,14 +1874,6 @@ status_t OMXCodec::allocateBuffersOnPort(OMX_U32 portIndex) {
     }
 
     status_t err = OK;
-    if ((mFlags & kStoreMetaDataInVideoBuffers)
-            && portIndex == kPortIndexInput) {
-        err = mOMX->storeMetaDataInBuffers(mNode, kPortIndexInput, OMX_TRUE);
-        if (err != OK) {
-            ALOGE("Storing meta data in video buffers is not supported");
-            return err;
-        }
-    }
 
     OMX_PARAM_PORTDEFINITIONTYPE def;
     InitOMXParams(&def);
@@ -1847,7 +1891,11 @@ status_t OMXCodec::allocateBuffersOnPort(OMX_U32 portIndex) {
             portIndex == kPortIndexInput ? "input" : "output");
 
     size_t totalSize = def.nBufferCountActual * def.nBufferSize;
+#ifdef ECLAIR_LIBCAMERA
+    mDealer[portIndex] = new MemoryDealer(totalSize);
+#else
     mDealer[portIndex] = new MemoryDealer(totalSize, "OMXCodec");
+#endif
 
     for (OMX_U32 i = 0; i < def.nBufferCountActual; ++i) {
         sp<IMemory> mem = mDealer[portIndex]->allocate(def.nBufferSize);
@@ -2018,11 +2066,17 @@ status_t OMXCodec::allocateOutputBuffersFromNativeWindow() {
     }
 
 #ifndef USE_SAMSUNG_COLORFORMAT
+    OMX_COLOR_FORMATTYPE format = def.format.video.eColorFormat;
+#ifdef QCOM_ICS_COMPAT
+    if(format == OMX_QCOM_COLOR_FormatYUV420PackedSemiPlanar64x32Tile2m8ka)
+        format = (OMX_COLOR_FORMATTYPE)HAL_PIXEL_FORMAT_YCbCr_420_SP_TILED;
+#endif
+
     err = native_window_set_buffers_geometry(
             mNativeWindow.get(),
             def.format.video.nFrameWidth,
             def.format.video.nFrameHeight,
-            def.format.video.eColorFormat);
+            format);
 #else
     OMX_COLOR_FORMATTYPE eColorFormat;
 
@@ -2044,6 +2098,7 @@ status_t OMXCodec::allocateOutputBuffersFromNativeWindow() {
             def.format.video.nFrameWidth,
             def.format.video.nFrameHeight,
             eColorFormat);
+
 #endif
 
     if (err != 0) {
@@ -5169,7 +5224,13 @@ void OMXCodec::initOutputFormat(const sp<MetaData> &inputFormat) {
 
             mOutputFormat->setInt32(kKeyWidth, video_def->nFrameWidth);
             mOutputFormat->setInt32(kKeyHeight, video_def->nFrameHeight);
-            mOutputFormat->setInt32(kKeyColorFormat, video_def->eColorFormat);
+#ifdef QCOM_LEGACY_OMX
+            // With legacy codec we get wrong color format here
+            if (!strncmp(mComponentName, "OMX.qcom.", 9))
+                mOutputFormat->setInt32(kKeyColorFormat, OMX_QCOM_COLOR_FormatYVU420SemiPlanar);
+            else
+#endif
+                mOutputFormat->setInt32(kKeyColorFormat, video_def->eColorFormat);
 
             if (!mIsEncoder) {
                 OMX_CONFIG_RECTTYPE rect;
